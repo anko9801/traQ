@@ -282,6 +282,10 @@ func (e *esEngine) Do(q *Query) (Result, error) {
 		offset = int(q.Offset.Int64)
 	}
 
+	if q.Expression.Valid {
+		parse(q.Expression.String)
+	}
+
 	// NOTE: 現状`sort.Key`はそのままesのソートキーとして使える前提
 	sort := q.GetSortKey()
 
@@ -347,7 +351,7 @@ func parse(source string) *elastic.BoolQuery {
 		fmt.Println(err)
 	}
 	e := elastic.NewBoolQuery()
-	return e.Must(*query)
+	return e.Must(query)
 }
 
 // <expr> := <clause> <clause>|<expr>
@@ -391,7 +395,7 @@ func parseLiteral(source string) (*Node, string, error) {
 	if kind != identifier {
 		field := term
 
-		term, kind, peeked = peek(peeked)
+		term, _, peeked = peek(peeked)
 		if term != "=" {
 			return nil, source, fmt.Errorf("Error: expected =, but find %s", term)
 		}
@@ -415,9 +419,9 @@ func parseLiteral(source string) (*Node, string, error) {
 
 	if term == "(" {
 		node, peeked, _ := parseExpression(peeked)
-		term, kind, peeked = peek(peeked)
+		term, _, peeked = peek(peeked)
 		if term != ")" {
-			return nil, peeked, fmt.Errorf("Error: unknown field %s")
+			return nil, peeked, fmt.Errorf("Error: expected ), but find %s", term)
 		}
 		return node, peeked, nil
 	}
@@ -425,7 +429,7 @@ func parseLiteral(source string) (*Node, string, error) {
 	return nil, source, nil
 }
 
-func generate(node *Node) (*elastic.Query, error) {
+func generate(node *Node) (elastic.Query, error) {
 	switch node.kind {
 	case Term:
 		term, err := generateTerm(node.field, node.value)
@@ -439,7 +443,7 @@ func generate(node *Node) (*elastic.Query, error) {
 		if err != nil {
 			return nil, err
 		}
-		return &elastic.NewBoolQuery().MustNot(*query).Query, nil
+		return elastic.NewBoolQuery().MustNot(query).Query, nil
 
 	case And:
 		lhs, err := generate(node.side[0])
@@ -450,7 +454,7 @@ func generate(node *Node) (*elastic.Query, error) {
 		if err != nil {
 			return nil, err
 		}
-		return &elastic.NewBoolQuery().Must(*lhs, *rhs).Query, nil
+		return elastic.NewBoolQuery().Must(lhs, rhs).Query, nil
 
 	case Or:
 		lhs, err := generate(node.side[0])
@@ -461,7 +465,7 @@ func generate(node *Node) (*elastic.Query, error) {
 		if err != nil {
 			return nil, err
 		}
-		return &elastic.NewBoolQuery().Should(*lhs, *rhs).Query, nil
+		return elastic.NewBoolQuery().Should(lhs, rhs).Query, nil
 
 	default:
 		return nil, nil
