@@ -42,6 +42,7 @@ type Query struct {
 	Limit          optional.Int    `query:"limit"`          // 取得件数
 	Offset         optional.Int    `query:"offset"`         // 取得Offset
 	Sort           optional.String `query:"sort"`           // 並び順 /[-\+]?key/
+	Expression     optional.String `query:"expression"`     // 検索クエリの論理式
 }
 
 func (q Query) Validate() error {

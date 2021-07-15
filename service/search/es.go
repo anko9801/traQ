@@ -3,6 +3,8 @@ package search
 import (
 	"context"
 	"fmt"
+	"regexp"
+	"strconv"
 	"time"
 
 	"github.com/gofrs/uuid"
@@ -306,4 +308,227 @@ func (e *esEngine) Close() error {
 	e.client.Stop()
 	e.done <- struct{}{}
 	return nil
+}
+
+type TokenKind int
+
+const (
+	err TokenKind = iota
+	identifier
+	number
+	symbol
+)
+
+type NodeKind int
+
+const (
+	Term NodeKind = iota
+	Not
+	And
+	Or
+)
+
+type Node struct {
+	kind  NodeKind
+	side  [2]*Node
+	field string
+	value string
+}
+
+func parse(source string) *elastic.BoolQuery {
+	node, _, err := parseExpression(source)
+	if err != nil {
+		fmt.Println(err)
+		return nil
+	}
+
+	query, err := generate(node)
+	if err != nil {
+		fmt.Println(err)
+	}
+	e := elastic.NewBoolQuery()
+	return e.Must(*query)
+}
+
+// <expr> := <clause> <clause>|<expr>
+func parseExpression(source string) (*Node, string, error) {
+	lhs, peeked, err := parseClause(source)
+	if err != nil {
+		return lhs, peeked, err
+	}
+
+	term, _, peeked := peek(source)
+	if term == "|" {
+		rhs, peeked, err := parseExpression(peeked)
+		return &Node{Or, [2]*Node{lhs, rhs}, "", ""}, peeked, err
+	}
+
+	return nil, source, nil
+}
+
+// <clause> := <literal> <literal>&<clause>
+func parseClause(source string) (*Node, string, error) {
+	lhs, peeked, err := parseLiteral(source)
+	if err != nil {
+		return lhs, peeked, err
+	}
+
+	term, _, peeked := peek(source)
+	if term == "&" {
+		rhs, peeked, err := parseClause(peeked)
+		return &Node{And, [2]*Node{lhs, rhs}, "", ""}, peeked, err
+	}
+
+	return nil, source, nil
+}
+
+// <field> := string
+// <value> := string
+// <literal> := <field>=<value> -<literal> (<expr>)
+func parseLiteral(source string) (*Node, string, error) {
+	term, kind, peeked := peek(source)
+
+	if kind != identifier {
+		field := term
+
+		term, kind, peeked = peek(peeked)
+		if term != "=" {
+			return nil, source, fmt.Errorf("Error: expected =, but find %s", term)
+		}
+
+		term, kind, peeked = peek(peeked)
+		if kind == symbol {
+			return nil, source, fmt.Errorf("Error: expected value, but find %s", term)
+		}
+
+		value := term
+		return &Node{Term, [2]*Node{nil, nil}, field, value}, peeked, nil
+	}
+
+	if term == "-" {
+		node, peeked, err := parseLiteral(peeked)
+		if err != nil {
+			return nil, source, err
+		}
+		return &Node{Not, [2]*Node{node, nil}, "", ""}, peeked, nil
+	}
+
+	if term == "(" {
+		node, peeked, _ := parseExpression(peeked)
+		term, kind, peeked = peek(peeked)
+		if term != ")" {
+			return nil, peeked, fmt.Errorf("Error: unknown field %s")
+		}
+		return node, peeked, nil
+	}
+
+	return nil, source, nil
+}
+
+func generate(node *Node) (*elastic.Query, error) {
+	switch node.kind {
+	case Term:
+		term, err := generateTerm(node.field, node.value)
+		if err != nil {
+			return nil, err
+		}
+		return term, nil
+
+	case Not:
+		query, err := generate(node.side[0])
+		if err != nil {
+			return nil, err
+		}
+		return &elastic.NewBoolQuery().MustNot(*query).Query, nil
+
+	case And:
+		lhs, err := generate(node.side[0])
+		if err != nil {
+			return nil, err
+		}
+		rhs, err := generate(node.side[1])
+		if err != nil {
+			return nil, err
+		}
+		return &elastic.NewBoolQuery().Must(*lhs, *rhs).Query, nil
+
+	case Or:
+		lhs, err := generate(node.side[0])
+		if err != nil {
+			return nil, err
+		}
+		rhs, err := generate(node.side[1])
+		if err != nil {
+			return nil, err
+		}
+		return &elastic.NewBoolQuery().Should(*lhs, *rhs).Query, nil
+
+	default:
+		return nil, nil
+	}
+}
+
+func generateTerm(field string, value string) (*elastic.TermQuery, error) {
+	switch field {
+	case "word":
+		return elastic.NewTermQuery(field, value), nil
+
+	case "after", "before":
+		t, err := time.Parse("2006-01-02 15:04:05", value)
+		if err != nil {
+			return nil, err
+		}
+		return elastic.NewTermQuery(field, t), nil
+
+	case "in", "to", "from", "citation":
+		uuid, err := uuid.FromString(value)
+		if err != nil {
+			return nil, fmt.Errorf("Error: expected uuid, but find %s", value)
+		}
+		return elastic.NewTermQuery(field, uuid), nil
+
+	case "bot", "hasurl", "hasattachments", "hasimage", "hasvideo", "hasaudio":
+		if value == "true" {
+			return elastic.NewTermQuery(field, true), nil
+		} else if value == "false" {
+			return elastic.NewTermQuery(field, false), nil
+		}
+		return nil, fmt.Errorf("Error: expected boolean, but find %s", value)
+
+	case "limit", "offset":
+		num, err := strconv.Atoi(value)
+		if err != nil {
+			return nil, err
+		}
+		return elastic.NewTermQuery(field, num), nil
+
+	case "sort":
+		return elastic.NewTermQuery(field, value), nil
+
+	default:
+		return nil, fmt.Errorf("Error: unknown field %s", field)
+	}
+}
+
+func peek(source string) (term string, kind TokenKind, peeked string) {
+	checkSymbol, _ := regexp.Compile("[A-Za-z][A-Za-z0-9]*")
+	loc := checkSymbol.FindIndex([]byte(source))
+	if loc != nil {
+		return source[loc[0]:loc[1]], identifier, source[loc[1]:]
+	}
+
+	checkNumber, _ := regexp.Compile("[0-9]+")
+	loc = checkNumber.FindIndex([]byte(source))
+	if loc != nil {
+		return source[loc[0]:loc[1]], number, source[loc[1]:]
+	}
+
+	switch source[0] {
+	case '[', ']', '(', ')', '|', '&', '-', '=':
+		return source[0:1], symbol, source[1:]
+	case ' ':
+		return peek(source[1:])
+	default:
+		return "", err, source
+	}
 }
