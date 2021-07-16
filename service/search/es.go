@@ -3,6 +3,7 @@ package search
 import (
 	"context"
 	"fmt"
+	"log"
 	"regexp"
 	"strconv"
 	"time"
@@ -356,34 +357,37 @@ func parse(source string) *elastic.BoolQuery {
 
 // <expr> := <clause> <clause>|<expr>
 func parseExpression(source string) (*Node, string, error) {
+	// fmt.Println("expression", source)
 	lhs, peeked, err := parseClause(source)
 	if err != nil {
-		return lhs, peeked, err
+		return nil, source, err
 	}
 
-	term, _, peeked := peek(source)
+	term, _, _peeked := peek(peeked)
 	if term == "|" {
-		rhs, peeked, err := parseExpression(peeked)
+		rhs, peeked, err := parseExpression(_peeked)
 		return &Node{Or, [2]*Node{lhs, rhs}, "", ""}, peeked, err
 	}
 
-	return nil, source, nil
+	return lhs, peeked, nil
 }
 
 // <clause> := <literal> <literal>&<clause>
 func parseClause(source string) (*Node, string, error) {
+	// fmt.Println("clause", source)
 	lhs, peeked, err := parseLiteral(source)
 	if err != nil {
-		return lhs, peeked, err
+		return nil, source, err
 	}
 
-	term, _, peeked := peek(source)
+	// and ではないときの為に以前のpeekedを持つ
+	term, _, _peeked := peek(peeked)
 	if term == "&" {
-		rhs, peeked, err := parseClause(peeked)
+		rhs, peeked, err := parseClause(_peeked)
 		return &Node{And, [2]*Node{lhs, rhs}, "", ""}, peeked, err
 	}
 
-	return nil, source, nil
+	return lhs, peeked, nil
 }
 
 // <field> := string
@@ -391,16 +395,20 @@ func parseClause(source string) (*Node, string, error) {
 // <literal> := <field>=<value> -<literal> (<expr>)
 func parseLiteral(source string) (*Node, string, error) {
 	term, kind, peeked := peek(source)
+	// fmt.Println("literal", term)
 
-	if kind != identifier {
+	if kind == identifier {
 		field := term
-
-		term, _, peeked = peek(peeked)
-		if term != "=" {
-			return nil, source, fmt.Errorf("Error: expected =, but find %s", term)
+		if field[0] == '#' || field[0] == '@' {
+			return &Node{Term, [2]*Node{nil, nil}, "in", field}, peeked, nil
 		}
 
-		term, kind, peeked = peek(peeked)
+		term, _, _peeked := peek(peeked)
+		if term != ":" {
+			return &Node{Term, [2]*Node{nil, nil}, "word", field}, peeked, nil
+		}
+
+		term, kind, peeked = peekValue(_peeked)
 		if kind == symbol {
 			return nil, source, fmt.Errorf("Error: expected value, but find %s", term)
 		}
@@ -426,7 +434,119 @@ func parseLiteral(source string) (*Node, string, error) {
 		return node, peeked, nil
 	}
 
-	return nil, source, nil
+	return nil, source, fmt.Errorf("Error: parsing literal")
+}
+
+func peek(source string) (term string, kind TokenKind, peeked string) {
+	spaceFlag := true
+	spaceEnd := 0
+	tokenEnd := len(source)
+
+	if len(source) == 0 {
+		return "", err, ""
+	}
+
+	// トークンを切り出す
+	for i := 0; i < len(source); i++ {
+		if spaceFlag {
+			if source[i] == ' ' {
+				spaceEnd++
+				continue
+			} else {
+				spaceFlag = false
+			}
+		}
+		if !spaceFlag && (source[i] == ' ' || source[i] == ':' || source[i] == '-' || source[i] == ')') {
+			tokenEnd = i
+			break
+		}
+		if i == len(source)-1 {
+			i = len(source)
+		}
+	}
+	if tokenEnd == spaceEnd {
+		tokenEnd = spaceEnd + 1
+	}
+	token := source[spaceEnd:tokenEnd]
+
+	checkNumber, _ := regexp.Compile("[0-9]+")
+	loc := checkNumber.FindIndex([]byte(token))
+	if len(loc) != 0 && loc[0] == 0 {
+		return token[loc[0]:loc[1]], number, source[tokenEnd:]
+	}
+
+	switch token[0] {
+	case '[', ']', '(', ')', '|', '&', '-', ':':
+		return token[0:1], symbol, source[spaceEnd+1:]
+	default:
+		return token, identifier, source[tokenEnd:]
+	}
+}
+
+func peekValue(source string) (term string, kind TokenKind, peeked string) {
+	checkUUID, _ := regexp.Compile("[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}")
+	loc := checkUUID.FindIndex([]byte(source))
+	if loc != nil && loc[0] == 0 {
+		return source[loc[0]:loc[1]], identifier, source[loc[1]:]
+	}
+
+	checkSymbol, _ := regexp.Compile("[A-Za-z@#][A-Za-z0-9:/.-]*")
+	loc = checkSymbol.FindIndex([]byte(source))
+	if loc != nil && loc[0] == 0 {
+		return source[loc[0]:loc[1]], identifier, source[loc[1]:]
+	}
+
+	checkSeparator, _ := regexp.Compile(" ")
+	loc = checkSeparator.FindIndex([]byte(source))
+	if loc != nil {
+		if loc[0] > 0 {
+			return source[0:loc[0]], identifier, source[loc[0]:]
+		}
+		if loc[0] == 0 {
+			return peekValue(source[1:])
+		}
+	}
+
+	return source, identifier, ""
+}
+
+func showAST(node *Node, tab int) (elastic.Query, error) {
+	tabText := ""
+	for i := 0; i < tab; i++ {
+		tabText += "\t"
+	}
+	switch node.kind {
+	case Term:
+		fmt.Println(tabText + "Term " + node.field + " " + node.value)
+
+	case Not:
+		fmt.Println(tabText + "Not")
+		showAST(node.side[0], tab+1)
+
+	case And:
+		fmt.Println(tabText + "And")
+		showAST(node.side[0], tab+1)
+		showAST(node.side[1], tab+1)
+
+	case Or:
+		fmt.Println(tabText + "Or")
+		showAST(node.side[0], tab+1)
+		showAST(node.side[1], tab+1)
+
+	default:
+		fmt.Println("test")
+		return nil, nil
+	}
+	return nil, nil
+}
+
+func test(source string) {
+	fmt.Println(source)
+	node, _, err := parseExpression(source)
+	if err != nil {
+		log.Fatal(err)
+	}
+	showAST(node, 0)
 }
 
 func generate(node *Node) (elastic.Query, error) {
@@ -511,28 +631,5 @@ func generateTerm(field string, value string) (*elastic.TermQuery, error) {
 
 	default:
 		return nil, fmt.Errorf("Error: unknown field %s", field)
-	}
-}
-
-func peek(source string) (term string, kind TokenKind, peeked string) {
-	checkSymbol, _ := regexp.Compile("[A-Za-z][A-Za-z0-9]*")
-	loc := checkSymbol.FindIndex([]byte(source))
-	if loc != nil {
-		return source[loc[0]:loc[1]], identifier, source[loc[1]:]
-	}
-
-	checkNumber, _ := regexp.Compile("[0-9]+")
-	loc = checkNumber.FindIndex([]byte(source))
-	if loc != nil {
-		return source[loc[0]:loc[1]], number, source[loc[1]:]
-	}
-
-	switch source[0] {
-	case '[', ']', '(', ')', '|', '&', '-', '=':
-		return source[0:1], symbol, source[1:]
-	case ' ':
-		return peek(source[1:])
-	default:
-		return "", err, source
 	}
 }
