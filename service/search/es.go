@@ -415,7 +415,7 @@ func parseLiteral(source string) (*Node, string, error) {
 
 		term, kind, peeked = peekValue(_peeked)
 		if kind == symbol {
-			return nil, source, fmt.Errorf("Error: expected value, but find %s", term)
+			return nil, source, fmt.Errorf("error: expected value, but find %s", term)
 		}
 
 		value := term
@@ -434,12 +434,12 @@ func parseLiteral(source string) (*Node, string, error) {
 		node, peeked, _ := parseExpression(peeked)
 		term, _, peeked = peek(peeked)
 		if term != ")" {
-			return nil, peeked, fmt.Errorf("Error: expected ), but find %s", term)
+			return nil, peeked, fmt.Errorf("error: expected ), but find %s", term)
 		}
 		return node, peeked, nil
 	}
 
-	return nil, source, fmt.Errorf("Error: parsing literal")
+	return nil, source, fmt.Errorf("error: cannot parse literal")
 }
 
 func peek(source string) (term string, kind TokenKind, peeked string) {
@@ -650,7 +650,7 @@ func generateTerm(field string, value string) (query elastic.Query, limit int, o
 	// case "citation":
 	// 	uuid, err := uuid.FromString(value)
 	// 	if err != nil {
-	// 		return nil, fmt.Errorf("Error: expected uuid, but find %s", value)
+	// 		return nil, fmt.Errorf("error: expected uuid, but find %s", value)
 	// 	}
 	// 	return elastic.NewTermQuery(field, uuid), nil
 
