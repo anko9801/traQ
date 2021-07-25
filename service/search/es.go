@@ -283,8 +283,12 @@ func (e *esEngine) Do(q *Query) (Result, error) {
 		offset = int(q.Offset.Int64)
 	}
 
+	query := elastic.NewBoolQuery().Must(musts...)
+
 	if q.Expression.Valid {
-		parse(q.Expression.String)
+		if len(musts) == 0 {
+			query, limit, offset = parse(q.Expression.String)
+		}
 	}
 
 	// NOTE: 現状`sort.Key`はそのままesのソートキーとして使える前提
@@ -292,7 +296,7 @@ func (e *esEngine) Do(q *Query) (Result, error) {
 
 	sr, err := e.client.Search().
 		Index(getIndexName(esMessageIndex)).
-		Query(elastic.NewBoolQuery().Must(musts...)).
+		Query(query).
 		Sort(sort.Key, !sort.Desc).
 		Size(limit).
 		From(offset).
@@ -318,7 +322,7 @@ func (e *esEngine) Close() error {
 type TokenKind int
 
 const (
-	err TokenKind = iota
+	EOF TokenKind = iota
 	identifier
 	number
 	symbol
@@ -335,24 +339,25 @@ const (
 
 type Node struct {
 	kind  NodeKind
-	side  [2]*Node
+	side  []*Node
 	field string
 	value string
 }
 
-func parse(source string) *elastic.BoolQuery {
+func parse(source string) (*elastic.BoolQuery, int, int) {
+	limit, offset := 20, 0
 	node, _, err := parseExpression(source)
 	if err != nil {
 		fmt.Println(err)
-		return nil
+		return nil, limit, offset
 	}
 
-	query, err := generate(node)
+	query, limit, offset, err := generate(node)
 	if err != nil {
 		fmt.Println(err)
 	}
 	e := elastic.NewBoolQuery()
-	return e.Must(query)
+	return e.Must(query), limit, offset
 }
 
 // <expr> := <clause> <clause>|<expr>
@@ -366,7 +371,7 @@ func parseExpression(source string) (*Node, string, error) {
 	term, _, _peeked := peek(peeked)
 	if term == "|" {
 		rhs, peeked, err := parseExpression(_peeked)
-		return &Node{Or, [2]*Node{lhs, rhs}, "", ""}, peeked, err
+		return &Node{Or, []*Node{lhs, rhs}, "", ""}, peeked, err
 	}
 
 	return lhs, peeked, nil
@@ -384,7 +389,7 @@ func parseClause(source string) (*Node, string, error) {
 	term, _, _peeked := peek(peeked)
 	if term == "&" {
 		rhs, peeked, err := parseClause(_peeked)
-		return &Node{And, [2]*Node{lhs, rhs}, "", ""}, peeked, err
+		return &Node{And, []*Node{lhs, rhs}, "", ""}, peeked, err
 	}
 
 	return lhs, peeked, nil
@@ -400,12 +405,12 @@ func parseLiteral(source string) (*Node, string, error) {
 	if kind == identifier {
 		field := term
 		if field[0] == '#' || field[0] == '@' {
-			return &Node{Term, [2]*Node{nil, nil}, "in", field}, peeked, nil
+			return &Node{Term, []*Node{nil, nil}, "in", field}, peeked, nil
 		}
 
 		term, _, _peeked := peek(peeked)
 		if term != ":" {
-			return &Node{Term, [2]*Node{nil, nil}, "word", field}, peeked, nil
+			return &Node{Term, []*Node{nil, nil}, "word", field}, peeked, nil
 		}
 
 		term, kind, peeked = peekValue(_peeked)
@@ -414,7 +419,7 @@ func parseLiteral(source string) (*Node, string, error) {
 		}
 
 		value := term
-		return &Node{Term, [2]*Node{nil, nil}, field, value}, peeked, nil
+		return &Node{Term, []*Node{nil, nil}, field, value}, peeked, nil
 	}
 
 	if term == "-" {
@@ -422,7 +427,7 @@ func parseLiteral(source string) (*Node, string, error) {
 		if err != nil {
 			return nil, source, err
 		}
-		return &Node{Not, [2]*Node{node, nil}, "", ""}, peeked, nil
+		return &Node{Not, []*Node{node, nil}, "", ""}, peeked, nil
 	}
 
 	if term == "(" {
@@ -443,7 +448,7 @@ func peek(source string) (term string, kind TokenKind, peeked string) {
 	tokenEnd := len(source)
 
 	if len(source) == 0 {
-		return "", err, ""
+		return "", EOF, ""
 	}
 
 	// トークンを切り出す
@@ -549,87 +554,132 @@ func test(source string) {
 	showAST(node, 0)
 }
 
-func generate(node *Node) (elastic.Query, error) {
+func generate(node *Node) (elastic.Query, int, int, error) {
+	limit, offset := 20, 0
 	switch node.kind {
 	case Term:
-		term, err := generateTerm(node.field, node.value)
+		term, limit, offset, err := generateTerm(node.field, node.value)
 		if err != nil {
-			return nil, err
+			return nil, limit, offset, err
 		}
-		return term, nil
+		return term, limit, offset, nil
 
 	case Not:
-		query, err := generate(node.side[0])
+		query, limit, offset, err := generate(node.side[0])
 		if err != nil {
-			return nil, err
+			return nil, limit, offset, err
 		}
-		return elastic.NewBoolQuery().MustNot(query).Query, nil
+		return elastic.NewBoolQuery().MustNot(query).Query, limit, offset, nil
 
 	case And:
-		lhs, err := generate(node.side[0])
+		lhs, limit, offset, err := generate(node.side[0])
 		if err != nil {
-			return nil, err
+			return nil, limit, offset, err
 		}
-		rhs, err := generate(node.side[1])
+		rhs, limit, offset, err := generate(node.side[1])
 		if err != nil {
-			return nil, err
+			return nil, limit, offset, err
 		}
-		return elastic.NewBoolQuery().Must(lhs, rhs).Query, nil
+		return elastic.NewBoolQuery().Must(lhs, rhs).Query, limit, offset, nil
 
 	case Or:
-		lhs, err := generate(node.side[0])
+		lhs, limit, offset, err := generate(node.side[0])
 		if err != nil {
-			return nil, err
+			return nil, limit, offset, err
 		}
-		rhs, err := generate(node.side[1])
+		rhs, limit, offset, err := generate(node.side[1])
 		if err != nil {
-			return nil, err
+			return nil, limit, offset, err
 		}
-		return elastic.NewBoolQuery().Should(lhs, rhs).Query, nil
+		return elastic.NewBoolQuery().Should(lhs, rhs).Query, limit, offset, nil
 
 	default:
-		return nil, nil
+		return nil, limit, offset, nil
 	}
 }
 
-func generateTerm(field string, value string) (*elastic.TermQuery, error) {
+func generateTerm(field string, value string) (query elastic.Query, limit int, offset int, err error) {
+	limit, offset = 20, 0
 	switch field {
 	case "word":
-		return elastic.NewTermQuery(field, value), nil
+		return elastic.NewSimpleQueryStringQuery(value), limit, offset, nil
 
-	case "after", "before":
-		t, err := time.Parse("2006-01-02 15:04:05", value)
+	case "after":
+		v, err := time.Parse(esDateFormat, value)
 		if err != nil {
-			return nil, err
+			return nil, limit, offset, err
 		}
-		return elastic.NewTermQuery(field, t), nil
+		return elastic.NewRangeQuery("createdAt").Gt(v), limit, offset, nil
 
-	case "in", "to", "from", "citation":
-		uuid, err := uuid.FromString(value)
+	case "before":
+		v, err := time.Parse(esDateFormat, value)
 		if err != nil {
-			return nil, fmt.Errorf("Error: expected uuid, but find %s", value)
+			return nil, limit, offset, err
 		}
-		return elastic.NewTermQuery(field, uuid), nil
+		return elastic.NewRangeQuery("createdAt").Lt(v), limit, offset, nil
+
+	case "has":
+		switch value {
+		case "attachments":
+			return elastic.NewTermQuery("hasAttachments", true), limit, offset, nil
+		case "image":
+			return elastic.NewTermQuery("hasImage", true), limit, offset, nil
+		case "audio":
+			return elastic.NewTermQuery("hasAudio", true), limit, offset, nil
+		case "video":
+			return elastic.NewTermQuery("hasVideo", true), limit, offset, nil
+		default:
+			return nil, limit, offset, fmt.Errorf("error: undefined field:value %s:%s in expression", field, value)
+		}
+
+	case "in", "to", "by", "from", "citation", "cite":
+		return elastic.NewTermQuery(field, value), limit, offset, nil
+
+	case "is":
+		if value == "bot" {
+			return elastic.NewTermQuery("bot", true), limit, offset, nil
+		}
+		return nil, limit, offset, fmt.Errorf("error: undefined field:value %s:%s in expression", field, value)
+
+	case "not":
+		if value == "bot" {
+			return elastic.NewTermQuery("bot", false), limit, offset, nil
+		}
+		return nil, limit, offset, fmt.Errorf("error: undefined field:value %s:%s in expression", field, value)
+
+	// case "citation":
+	// 	uuid, err := uuid.FromString(value)
+	// 	if err != nil {
+	// 		return nil, fmt.Errorf("Error: expected uuid, but find %s", value)
+	// 	}
+	// 	return elastic.NewTermQuery(field, uuid), nil
 
 	case "bot", "hasurl", "hasattachments", "hasimage", "hasvideo", "hasaudio":
 		if value == "true" {
-			return elastic.NewTermQuery(field, true), nil
+			return elastic.NewTermQuery(field, true), limit, offset, nil
 		} else if value == "false" {
-			return elastic.NewTermQuery(field, false), nil
+			return elastic.NewTermQuery(field, false), limit, offset, nil
 		}
-		return nil, fmt.Errorf("Error: expected boolean, but find %s", value)
+		return nil, limit, offset, fmt.Errorf("error: expected boolean, but find %s", value)
 
-	case "limit", "offset":
-		num, err := strconv.Atoi(value)
+	case "limit":
+		limit, err := strconv.Atoi(value)
 		if err != nil {
-			return nil, err
+			return nil, limit, offset, err
 		}
-		return elastic.NewTermQuery(field, num), nil
+		return nil, limit, offset, nil
+
+	case "offset":
+		offset, err := strconv.Atoi(value)
+		if err != nil {
+			return nil, limit, offset, err
+		}
+		return nil, limit, offset, nil
 
 	case "sort":
-		return elastic.NewTermQuery(field, value), nil
+		return nil, limit, offset, fmt.Errorf("error: undefined field:value %s:%s in expression", field, value)
 
 	default:
-		return nil, fmt.Errorf("Error: unknown field %s", field)
+		return nil, limit, offset, fmt.Errorf("error: undefined field:value %s:%s in expression", field, value)
 	}
 }
