@@ -515,7 +515,7 @@ func peekValue(source string) (term string, kind TokenKind, peeked string) {
 	return source, identifier, ""
 }
 
-func showAST(node *Node, tab int) (elastic.Query, error) {
+func showAST(node *Node, tab int) {
 	tabText := ""
 	for i := 0; i < tab; i++ {
 		tabText += "\t"
@@ -540,9 +540,7 @@ func showAST(node *Node, tab int) (elastic.Query, error) {
 
 	default:
 		fmt.Println("test")
-		return nil, nil
 	}
-	return nil, nil
 }
 
 func test(source string) {
